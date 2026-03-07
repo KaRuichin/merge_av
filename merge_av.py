@@ -31,13 +31,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-# 尝试导入 questionary，如果不可用则降级到普通 input
 try:
-    import questionary
+    from InquirerPy import inquirer as inq
+    from InquirerPy.base.control import Choice
 
-    HAS_QUESTIONARY = True
+    INTERACTIVE_UI = True
 except ImportError:
-    HAS_QUESTIONARY = False
+    INTERACTIVE_UI = False
 
 # 编码器配置
 # 格式: {gpu_type: {codec: [encoder_list]}}
@@ -85,6 +85,103 @@ VIDEO_STREAM_IDS = {
     "30016",
 }
 AUDIO_STREAM_IDS = {"30280", "30232", "30216", "30250", "30251"}
+
+
+# ---------------------------------------------------------------------------
+# 交互式 UI 辅助函数（支持 ↑↓ 方向键 + 键盘数字键）
+# ---------------------------------------------------------------------------
+
+
+def interactive_select(message: str, choices: list, default_index: int = 0):
+    """
+    交互式选择菜单。
+    - 安装了 InquirerPy 时: 支持 ↑↓ 方向键、数字键快速跳转。
+    - 未安装时: 降级为键盘输入序号。
+    choices: [(显示文本, 返回值), ...]
+    返回选中项的值。
+    """
+    if INTERACTIVE_UI:
+        choice_objs = [
+            Choice(value=val, name=f" {i + 1}. {name}")
+            for i, (name, val) in enumerate(choices)
+        ]
+        prompt = inq.select(
+            message=message,
+            choices=choice_objs,
+            default=(
+                choice_objs[default_index].value
+                if default_index < len(choices)
+                else None
+            ),
+            instruction="(↑↓ 选择，数字键快选，Enter 确认)",
+        )
+        # 注册数字键 1-9 快捷跳转
+        for idx in range(min(len(choices), 9)):
+
+            def _make_handler(target):
+                def _handler(event):
+                    prompt.content_control.selected_choice_index = target
+
+                return _handler
+
+            prompt.register_kb(str(idx + 1))(_make_handler(idx))
+
+        return prompt.execute()
+
+    # 降级: 纯键盘输入
+    print(f"\n{message}")
+    for i, (name, _) in enumerate(choices):
+        print(f"  [{i + 1}] {name}")
+    print()
+    while True:
+        inp = input(
+            f"请输入选项 [1-{len(choices)}]，默认为 {default_index + 1}: "
+        ).strip()
+        if inp == "":
+            return choices[default_index][1]
+        try:
+            idx = int(inp) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx][1]
+        except ValueError:
+            pass
+        print(f"无效选项，请输入 1-{len(choices)}")
+
+
+def interactive_confirm(message: str, default: bool = True) -> bool:
+    """交互式确认提示。"""
+    if INTERACTIVE_UI:
+        return inq.confirm(message=message, default=default).execute()
+    suffix = "[Y/n]" if default else "[y/N]"
+    result = input(f"{message} {suffix}: ").strip().lower()
+    if result == "":
+        return default
+    return result in ("y", "yes")
+
+
+def interactive_number(message: str, default: int, min_val: int, max_val: int) -> int:
+    """交互式数字输入。"""
+    if INTERACTIVE_UI:
+        return int(
+            inq.number(
+                message=message,
+                default=default,
+                min_allowed=min_val,
+                max_allowed=max_val,
+                float_allowed=False,
+            ).execute()
+        )
+    while True:
+        inp = input(f"{message} [{min_val}-{max_val}]，默认为 {default}: ").strip()
+        if inp == "":
+            return default
+        try:
+            val = int(inp)
+            if min_val <= val <= max_val:
+                return val
+            print(f"错误: 范围为 {min_val}~{max_val}，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字")
 
 
 def get_available_encoders() -> dict:
@@ -237,62 +334,32 @@ def prompt_encoding_choice(available_encoders: dict, gpus: list) -> tuple:
     codec: "copy" | "h265" | "av1"
     """
     choices = [
-        {"name": "直接复制（最快，零质量损失）", "value": "copy"},
-        {"name": "H.265/HEVC 编码（兼容性好，体积小）", "value": "h265"},
-        {"name": "H.265/HEVC 自定义 CRF 值", "value": "h265_custom"},
-        {"name": "AV1 视觉无损编码（CRF=23，体积最小）", "value": "av1"},
-        {"name": "AV1 真正无损编码（数学意义无损）", "value": "av1_lossless"},
-        {"name": "AV1 自定义 CRF 值", "value": "av1_custom"},
+        ("直接复制（最快，零质量损失）", "copy"),
+        ("H.265/HEVC 编码（兼容性好，体积小）", "h265"),
+        ("H.265/HEVC 自定义 CRF 值", "h265_crf"),
+        ("AV1 视觉无损编码（CRF=23，体积最小）", "av1"),
+        ("AV1 真正无损编码（数学意义无损）", "av1_lossless"),
+        ("AV1 自定义 CRF 值", "av1_crf"),
     ]
 
-    if HAS_QUESTIONARY:
-        choice = questionary.select(
-            "\n请选择编码方式:",
-            choices=[c["name"] for c in choices],
-            use_shortcuts=True,
-            use_arrow_keys=True,
-        ).ask()
+    result = interactive_select("请选择编码方式:", choices)
 
-        # 找到对应的 value
-        selected_value = next(c["value"] for c in choices if c["name"] == choice)
-    else:
-        # 降级方案：使用传统 input
-        print("\n请选择编码方式:")
-        for i, c in enumerate(choices, 1):
-            print(f"  [{i}] {c['name']}")
-        print()
-
-        while True:
-            choice_input = input("请输入选项 [1-6]，默认为 1: ").strip()
-            if choice_input == "":
-                selected_value = "copy"
-                break
-            try:
-                idx = int(choice_input) - 1
-                if 0 <= idx < len(choices):
-                    selected_value = choices[idx]["value"]
-                    break
-                print("无效选项，请输入 1-6")
-            except ValueError:
-                print("错误: 请输入有效数字")
-
-    # 根据选择返回对应参数
-    if selected_value == "copy":
+    if result == "copy":
         return "copy", False, 23, "cpu", "copy"
-    elif selected_value == "h265":
+    elif result == "h265":
         gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
         return "h265", False, 23, gpu, encoder
-    elif selected_value == "h265_custom":
+    elif result == "h265_crf":
         gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
         crf = prompt_crf_choice("h265")
         return "h265", False, crf, gpu, encoder
-    elif selected_value == "av1":
+    elif result == "av1":
         gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
         return "av1", False, 23, gpu, encoder
-    elif selected_value == "av1_lossless":
+    elif result == "av1_lossless":
         gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
         return "av1", True, 0, gpu, encoder
-    elif selected_value == "av1_custom":
+    else:  # av1_crf
         gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
         crf = prompt_crf_choice("av1")
         return "av1", False, crf, gpu, encoder
@@ -303,7 +370,6 @@ def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple
     提示用户选择 GPU 进行编码。
     返回: (gpu_type: str, encoder: str)
     """
-    # 筛选支持当前编解码器的 GPU
     valid_gpus = []
     for gpu_type, gpu_name in gpus:
         encoder = detect_encoder(codec, gpu_type, available_encoders)
@@ -321,47 +387,13 @@ def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple
         print(f"\n使用编码器: {encoder} ({gpu_name})")
         return gpu_type, encoder
 
-    # 构建选项列表
     choices = []
-    for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus, 1):
-        recommend = "  (推荐)" if i == 1 and gpu_type != "cpu" else ""
-        label = (
-            f"{GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend} [{encoder}]"
-        )
-        choices.append({"name": label, "value": i - 1})
+    for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus):
+        recommend = " (推荐)" if i == 0 and gpu_type != "cpu" else ""
+        name = f"{GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend} [{encoder}]"
+        choices.append((name, i))
 
-    if HAS_QUESTIONARY:
-        selected_label = questionary.select(
-            f"\n请选择用于 {codec.upper()} 编码的设备:",
-            choices=[c["name"] for c in choices],
-            use_shortcuts=True,
-            use_arrow_keys=True,
-        ).ask()
-
-        # 找到对应的索引
-        idx = next(c["value"] for c in choices if c["name"] == selected_label)
-    else:
-        # 降级方案
-        print(f"\n请选择用于 {codec.upper()} 编码的设备:")
-        for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus, 1):
-            recommend = " (推荐)" if i == 1 and gpu_type != "cpu" else ""
-            print(f"  [{i}] {GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend}")
-            print(f"      编码器: {encoder}")
-        print()
-
-        while True:
-            choice = input(f"请输入选项 [1-{len(valid_gpus)}]，默认为 1: ").strip()
-            if choice == "":
-                idx = 0
-                break
-            try:
-                idx = int(choice) - 1
-                if 0 <= idx < len(valid_gpus):
-                    break
-                print(f"无效选项，请输入 1-{len(valid_gpus)}")
-            except ValueError:
-                print("错误: 请输入有效数字")
-
+    idx = interactive_select(f"请选择用于 {codec.upper()} 编码的设备:", choices)
     gpu_type, gpu_name, encoder = valid_gpus[idx]
     print(f"已选择: {GPU_NAMES.get(gpu_type, gpu_type)} - {encoder}")
     return gpu_type, encoder
@@ -374,26 +406,12 @@ def prompt_crf_choice(codec: str) -> int:
     else:  # av1
         default_crf, max_crf = 23, 63
 
-    prompt_text = f"请输入 CRF 值 [0-{max_crf}]，默认为 {default_crf}（值越小质量越高）"
-
-    while True:
-        if HAS_QUESTIONARY:
-            crf_input = questionary.text(
-                prompt_text + ":",
-                default=str(default_crf),
-            ).ask()
-        else:
-            crf_input = input(prompt_text + ": ").strip()
-
-        if crf_input == "" or crf_input == str(default_crf):
-            return default_crf
-        try:
-            crf = int(crf_input)
-            if 0 <= crf <= max_crf:
-                return crf
-            print(f"错误: CRF 范围为 0~{max_crf}，请重新输入")
-        except ValueError:
-            print("错误: 请输入有效数字")
+    return interactive_number(
+        f"请输入 CRF 值（值越小质量越高）:",
+        default=default_crf,
+        min_val=0,
+        max_val=max_crf,
+    )
 
 
 def build_video_codec_args(
@@ -471,17 +489,7 @@ def auto_merge_mode() -> None:
         print(f"      视频: {video.name}")
         print(f"      音频: {audio.name}")
 
-    if HAS_QUESTIONARY:
-        confirm = questionary.confirm(
-            "\n是否继续合并？",
-            default=True,
-            auto_enter=False,
-        ).ask()
-    else:
-        confirm_input = input("\n是否继续合并？[Y/n]: ").strip().lower()
-        confirm = confirm_input != "n"
-
-    if not confirm:
+    if not interactive_confirm("是否继续合并？"):
         print("已取消")
         sys.exit(0)
 
