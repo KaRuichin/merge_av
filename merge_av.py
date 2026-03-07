@@ -679,4 +679,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n已取消操作。")
+        sys.exit(130)
