@@ -7,6 +7,22 @@
 
 - Python 3.7+
 - [ffmpeg](https://ffmpeg.org/download.html)（需已安装并加入系统 PATH）
+- **questionary**（可选，用于更友好的交互式菜单）
+
+### 安装依赖
+
+```bash
+# 基础使用（仅需 ffmpeg）
+# 下载 ffmpeg 并加入 PATH
+
+# 推荐：安装 questionary 以支持键盘导航和鼠标点击
+pip install questionary
+
+# 或使用 requirements.txt 一键安装
+pip install -r requirements.txt
+```
+
+> **注意：** 不安装 questionary 也可以正常使用，程序会自动降级到传统文本输入模式。
 
 ## 支持的编码器
 
@@ -34,6 +50,17 @@ python merge_av.py
 3. **交互式选择编码方式**（直接复制 / H.265 / AV1）
 4. **交互式选择 GPU**（默认优先使用独立显卡）
 5. 批量执行合并
+
+### 交互式菜单支持
+
+安装 `questionary` 后，程序支持：
+
+- ✅ **键盘上下箭头导航**选择选项
+- ✅ **回车键确认**选择
+- ✅ **鼠标点击**选项（在支持的终端，如 Windows Terminal）
+- ✅ **数字快捷键**快速选择
+
+未安装 `questionary` 时，仍可通过输入数字序号选择。
 
 支持的文件命名格式：`<前缀>-<流ID>.mp4`，例如：
 

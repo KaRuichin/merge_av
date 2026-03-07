@@ -31,6 +31,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+# 尝试导入 questionary，如果不可用则降级到普通 input
+try:
+    import questionary
+
+    HAS_QUESTIONARY = True
+except ImportError:
+    HAS_QUESTIONARY = False
+
 # 编码器配置
 # 格式: {gpu_type: {codec: [encoder_list]}}
 ENCODERS = {
@@ -228,45 +236,66 @@ def prompt_encoding_choice(available_encoders: dict, gpus: list) -> tuple:
     返回: (codec: str, lossless: bool, crf: int, gpu: str, encoder: str)
     codec: "copy" | "h265" | "av1"
     """
-    print("\n请选择编码方式:")
-    print("  [1] 直接复制（最快，零质量损失）")
-    print("  [2] H.265/HEVC 编码（兼容性好，体积小）")
-    print("  [3] H.265/HEVC 自定义 CRF 值")
-    print("  [4] AV1 视觉无损编码（CRF=23，体积最小）")
-    print("  [5] AV1 真正无损编码（数学意义无损）")
-    print("  [6] AV1 自定义 CRF 值")
-    print()
+    choices = [
+        {"name": "直接复制（最快，零质量损失）", "value": "copy"},
+        {"name": "H.265/HEVC 编码（兼容性好，体积小）", "value": "h265"},
+        {"name": "H.265/HEVC 自定义 CRF 值", "value": "h265_custom"},
+        {"name": "AV1 视觉无损编码（CRF=23，体积最小）", "value": "av1"},
+        {"name": "AV1 真正无损编码（数学意义无损）", "value": "av1_lossless"},
+        {"name": "AV1 自定义 CRF 值", "value": "av1_custom"},
+    ]
 
-    while True:
-        choice = input("请输入选项 [1-6]，默认为 1: ").strip()
+    if HAS_QUESTIONARY:
+        choice = questionary.select(
+            "\n请选择编码方式:",
+            choices=[c["name"] for c in choices],
+            use_shortcuts=True,
+            use_arrow_keys=True,
+        ).ask()
 
-        if choice == "" or choice == "1":
-            return "copy", False, 23, "cpu", "copy"
+        # 找到对应的 value
+        selected_value = next(c["value"] for c in choices if c["name"] == choice)
+    else:
+        # 降级方案：使用传统 input
+        print("\n请选择编码方式:")
+        for i, c in enumerate(choices, 1):
+            print(f"  [{i}] {c['name']}")
+        print()
 
-        elif choice == "2":
-            gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
-            return "h265", False, 23, gpu, encoder
+        while True:
+            choice_input = input("请输入选项 [1-6]，默认为 1: ").strip()
+            if choice_input == "":
+                selected_value = "copy"
+                break
+            try:
+                idx = int(choice_input) - 1
+                if 0 <= idx < len(choices):
+                    selected_value = choices[idx]["value"]
+                    break
+                print("无效选项，请输入 1-6")
+            except ValueError:
+                print("错误: 请输入有效数字")
 
-        elif choice == "3":
-            gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
-            crf = prompt_crf_choice("h265")
-            return "h265", False, crf, gpu, encoder
-
-        elif choice == "4":
-            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
-            return "av1", False, 23, gpu, encoder
-
-        elif choice == "5":
-            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
-            return "av1", True, 0, gpu, encoder
-
-        elif choice == "6":
-            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
-            crf = prompt_crf_choice("av1")
-            return "av1", False, crf, gpu, encoder
-
-        else:
-            print("无效选项，请输入 1-6")
+    # 根据选择返回对应参数
+    if selected_value == "copy":
+        return "copy", False, 23, "cpu", "copy"
+    elif selected_value == "h265":
+        gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
+        return "h265", False, 23, gpu, encoder
+    elif selected_value == "h265_custom":
+        gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
+        crf = prompt_crf_choice("h265")
+        return "h265", False, crf, gpu, encoder
+    elif selected_value == "av1":
+        gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+        return "av1", False, 23, gpu, encoder
+    elif selected_value == "av1_lossless":
+        gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+        return "av1", True, 0, gpu, encoder
+    elif selected_value == "av1_custom":
+        gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+        crf = prompt_crf_choice("av1")
+        return "av1", False, crf, gpu, encoder
 
 
 def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple:
@@ -292,30 +321,50 @@ def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple
         print(f"\n使用编码器: {encoder} ({gpu_name})")
         return gpu_type, encoder
 
-    print(f"\n请选择用于 {codec.upper()} 编码的设备:")
+    # 构建选项列表
+    choices = []
     for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus, 1):
-        recommend = " (推荐)" if i == 1 and gpu_type != "cpu" else ""
-        print(f"  [{i}] {GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend}")
-        print(f"      编码器: {encoder}")
-    print()
+        recommend = "  (推荐)" if i == 1 and gpu_type != "cpu" else ""
+        label = (
+            f"{GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend} [{encoder}]"
+        )
+        choices.append({"name": label, "value": i - 1})
 
-    while True:
-        choice = input(f"请输入选项 [1-{len(valid_gpus)}]，默认为 1: ").strip()
-        if choice == "":
-            idx = 0
-        else:
+    if HAS_QUESTIONARY:
+        selected_label = questionary.select(
+            f"\n请选择用于 {codec.upper()} 编码的设备:",
+            choices=[c["name"] for c in choices],
+            use_shortcuts=True,
+            use_arrow_keys=True,
+        ).ask()
+
+        # 找到对应的索引
+        idx = next(c["value"] for c in choices if c["name"] == selected_label)
+    else:
+        # 降级方案
+        print(f"\n请选择用于 {codec.upper()} 编码的设备:")
+        for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus, 1):
+            recommend = " (推荐)" if i == 1 and gpu_type != "cpu" else ""
+            print(f"  [{i}] {GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend}")
+            print(f"      编码器: {encoder}")
+        print()
+
+        while True:
+            choice = input(f"请输入选项 [1-{len(valid_gpus)}]，默认为 1: ").strip()
+            if choice == "":
+                idx = 0
+                break
             try:
                 idx = int(choice) - 1
-                if not (0 <= idx < len(valid_gpus)):
-                    print(f"无效选项，请输入 1-{len(valid_gpus)}")
-                    continue
+                if 0 <= idx < len(valid_gpus):
+                    break
+                print(f"无效选项，请输入 1-{len(valid_gpus)}")
             except ValueError:
                 print("错误: 请输入有效数字")
-                continue
 
-        gpu_type, gpu_name, encoder = valid_gpus[idx]
-        print(f"已选择: {GPU_NAMES.get(gpu_type, gpu_type)} - {encoder}")
-        return gpu_type, encoder
+    gpu_type, gpu_name, encoder = valid_gpus[idx]
+    print(f"已选择: {GPU_NAMES.get(gpu_type, gpu_type)} - {encoder}")
+    return gpu_type, encoder
 
 
 def prompt_crf_choice(codec: str) -> int:
@@ -325,11 +374,18 @@ def prompt_crf_choice(codec: str) -> int:
     else:  # av1
         default_crf, max_crf = 23, 63
 
+    prompt_text = f"请输入 CRF 值 [0-{max_crf}]，默认为 {default_crf}（值越小质量越高）"
+
     while True:
-        crf_input = input(
-            f"请输入 CRF 值 [0-{max_crf}]，默认为 {default_crf}（值越小质量越高）: "
-        ).strip()
-        if crf_input == "":
+        if HAS_QUESTIONARY:
+            crf_input = questionary.text(
+                prompt_text + ":",
+                default=str(default_crf),
+            ).ask()
+        else:
+            crf_input = input(prompt_text + ": ").strip()
+
+        if crf_input == "" or crf_input == str(default_crf):
             return default_crf
         try:
             crf = int(crf_input)
@@ -415,8 +471,17 @@ def auto_merge_mode() -> None:
         print(f"      视频: {video.name}")
         print(f"      音频: {audio.name}")
 
-    confirm = input("\n是否继续合并？[Y/n]: ").strip().lower()
-    if confirm == "n":
+    if HAS_QUESTIONARY:
+        confirm = questionary.confirm(
+            "\n是否继续合并？",
+            default=True,
+            auto_enter=False,
+        ).ask()
+    else:
+        confirm_input = input("\n是否继续合并？[Y/n]: ").strip().lower()
+        confirm = confirm_input != "n"
+
+    if not confirm:
         print("已取消")
         sys.exit(0)
 
