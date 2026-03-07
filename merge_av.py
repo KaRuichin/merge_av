@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 # 编码器配置
-# 格式: {gpu_type: {codec: encoder_name}}
+# 格式: {gpu_type: {codec: [encoder_list]}}
 ENCODERS = {
     # 软件编码器
     "cpu": {
@@ -65,7 +65,6 @@ GPU_NAMES = {
 }
 
 # B站等平台常见的流 ID（用于区分视频/音频）
-# 视频流 ID 通常以 30 开头且较小，音频流 ID 通常以 30 开头且较大
 VIDEO_STREAM_IDS = {
     "30116",
     "30112",
@@ -78,6 +77,94 @@ VIDEO_STREAM_IDS = {
     "30016",
 }
 AUDIO_STREAM_IDS = {"30280", "30232", "30216", "30250", "30251"}
+
+
+def get_available_encoders() -> dict:
+    """检测 ffmpeg 支持的所有编码器，返回可用编码器字典。"""
+    result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+    output = result.stdout
+
+    available = {}
+    for gpu_type, codecs in ENCODERS.items():
+        available[gpu_type] = {}
+        for codec, encoder_list in codecs.items():
+            for enc in encoder_list:
+                if enc in output:
+                    available[gpu_type][codec] = enc
+                    break
+    return available
+
+
+def detect_gpus() -> list:
+    """
+    检测系统中可用的 GPU，返回 GPU 类型列表。
+    优先返回独立显卡（NVIDIA > AMD > Intel）。
+    """
+    gpus = []
+
+    # 检测 NVIDIA GPU
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            gpus.append(("nvidia", result.stdout.strip().split("\n")[0]))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 在 Windows 上通过 WMIC 检测显卡
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["wmic", "path", "win32_videocontroller", "get", "name"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                lines = [
+                    line.strip()
+                    for line in result.stdout.split("\n")
+                    if line.strip() and line.strip() != "Name"
+                ]
+                for line in lines:
+                    line_lower = line.lower()
+                    if "nvidia" in line_lower and not any(
+                        g[0] == "nvidia" for g in gpus
+                    ):
+                        gpus.append(("nvidia", line))
+                    elif "amd" in line_lower or "radeon" in line_lower:
+                        gpus.append(("amd", line))
+                    elif "intel" in line_lower:
+                        gpus.append(("intel", line))
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # 始终添加 CPU 选项
+    gpus.append(("cpu", "CPU 软件编码"))
+
+    # 去重并按优先级排序：nvidia > amd > intel > cpu
+    seen = set()
+    unique_gpus = []
+    priority = {"nvidia": 0, "amd": 1, "intel": 2, "cpu": 3}
+    gpus.sort(key=lambda x: priority.get(x[0], 99))
+
+    for gpu_type, gpu_name in gpus:
+        if gpu_type not in seen:
+            seen.add(gpu_type)
+            unique_gpus.append((gpu_type, gpu_name))
+
+    return unique_gpus
+
+
+def detect_encoder(codec: str, gpu: str, available_encoders: dict) -> Optional[str]:
+    """检测指定编解码器和 GPU 组合的可用编码器。"""
+    if gpu in available_encoders and codec in available_encoders[gpu]:
+        return available_encoders[gpu][codec]
+    return None
 
 
 def detect_media_pairs(directory: Path = None) -> list:
@@ -108,7 +195,6 @@ def detect_media_pairs(directory: Path = None) -> list:
         if len(files) < 2:
             continue
 
-        # 尝试识别视频和音频文件
         video_file = None
         audio_file = None
 
@@ -118,11 +204,10 @@ def detect_media_pairs(directory: Path = None) -> list:
             elif stream_id in AUDIO_STREAM_IDS:
                 audio_file = filepath
 
-        # 如果无法通过已知 ID 识别，使用启发式方法：较小的 ID 通常是视频
+        # 启发式方法：文件大小判断
         if video_file is None or audio_file is None:
             sorted_files = sorted(files, key=lambda x: int(x[0]))
             if len(sorted_files) >= 2:
-                # 检查文件大小：视频文件通常比音频大
                 file1, file2 = sorted_files[0][1], sorted_files[1][1]
                 if file1.stat().st_size > file2.stat().st_size:
                     video_file, audio_file = file1, file2
@@ -137,40 +222,178 @@ def detect_media_pairs(directory: Path = None) -> list:
     return pairs
 
 
-def prompt_encoding_choice() -> tuple:
+def prompt_encoding_choice(available_encoders: dict, gpus: list) -> tuple:
     """
-    交互式提示用户选择编码方式。
-    返回: (av1: bool, lossless: bool, crf: int)
+    交互式提示用户选择编码方式和 GPU。
+    返回: (codec: str, lossless: bool, crf: int, gpu: str, encoder: str)
+    codec: "copy" | "h265" | "av1"
     """
     print("\n请选择编码方式:")
     print("  [1] 直接复制（最快，零质量损失）")
-    print("  [2] AV1 视觉无损编码（CRF=23，体积小 ~50%）")
-    print("  [3] AV1 真正无损编码（数学意义无损）")
-    print("  [4] AV1 自定义 CRF 值")
+    print("  [2] H.265/HEVC 编码（兼容性好，体积小）")
+    print("  [3] H.265/HEVC 自定义 CRF 值")
+    print("  [4] AV1 视觉无损编码（CRF=23，体积最小）")
+    print("  [5] AV1 真正无损编码（数学意义无损）")
+    print("  [6] AV1 自定义 CRF 值")
     print()
 
     while True:
-        choice = input("请输入选项 [1-4]，默认为 1: ").strip()
+        choice = input("请输入选项 [1-6]，默认为 1: ").strip()
+
         if choice == "" or choice == "1":
-            return False, False, 23
+            return "copy", False, 23, "cpu", "copy"
+
         elif choice == "2":
-            return True, False, 23
+            gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
+            return "h265", False, 23, gpu, encoder
+
         elif choice == "3":
-            return True, True, 0
+            gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
+            crf = prompt_crf_choice("h265")
+            return "h265", False, crf, gpu, encoder
+
         elif choice == "4":
-            while True:
-                crf_input = input("请输入 CRF 值 [0-63]，默认为 23: ").strip()
-                if crf_input == "":
-                    return True, False, 23
-                try:
-                    crf = int(crf_input)
-                    if 0 <= crf <= 63:
-                        return True, False, crf
-                    print("错误: CRF 范围为 0~63，请重新输入")
-                except ValueError:
-                    print("错误: 请输入有效数字")
+            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+            return "av1", False, 23, gpu, encoder
+
+        elif choice == "5":
+            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+            return "av1", True, 0, gpu, encoder
+
+        elif choice == "6":
+            gpu, encoder = prompt_gpu_choice("av1", available_encoders, gpus)
+            crf = prompt_crf_choice("av1")
+            return "av1", False, crf, gpu, encoder
+
         else:
-            print("无效选项，请输入 1-4")
+            print("无效选项，请输入 1-6")
+
+
+def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple:
+    """
+    提示用户选择 GPU 进行编码。
+    返回: (gpu_type: str, encoder: str)
+    """
+    # 筛选支持当前编解码器的 GPU
+    valid_gpus = []
+    for gpu_type, gpu_name in gpus:
+        encoder = detect_encoder(codec, gpu_type, available_encoders)
+        if encoder:
+            valid_gpus.append((gpu_type, gpu_name, encoder))
+
+    if not valid_gpus:
+        sys.exit(
+            f"错误: 未找到支持 {codec.upper()} 的编码器。\n"
+            "请安装包含相应编码器的 ffmpeg 版本。"
+        )
+
+    if len(valid_gpus) == 1:
+        gpu_type, gpu_name, encoder = valid_gpus[0]
+        print(f"\n使用编码器: {encoder} ({gpu_name})")
+        return gpu_type, encoder
+
+    print(f"\n请选择用于 {codec.upper()} 编码的设备:")
+    for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus, 1):
+        recommend = " (推荐)" if i == 1 and gpu_type != "cpu" else ""
+        print(f"  [{i}] {GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend}")
+        print(f"      编码器: {encoder}")
+    print()
+
+    while True:
+        choice = input(f"请输入选项 [1-{len(valid_gpus)}]，默认为 1: ").strip()
+        if choice == "":
+            idx = 0
+        else:
+            try:
+                idx = int(choice) - 1
+                if not (0 <= idx < len(valid_gpus)):
+                    print(f"无效选项，请输入 1-{len(valid_gpus)}")
+                    continue
+            except ValueError:
+                print("错误: 请输入有效数字")
+                continue
+
+        gpu_type, gpu_name, encoder = valid_gpus[idx]
+        print(f"已选择: {GPU_NAMES.get(gpu_type, gpu_type)} - {encoder}")
+        return gpu_type, encoder
+
+
+def prompt_crf_choice(codec: str) -> int:
+    """提示用户输入 CRF 值。"""
+    if codec == "h265":
+        default_crf, max_crf = 23, 51
+    else:  # av1
+        default_crf, max_crf = 23, 63
+
+    while True:
+        crf_input = input(
+            f"请输入 CRF 值 [0-{max_crf}]，默认为 {default_crf}（值越小质量越高）: "
+        ).strip()
+        if crf_input == "":
+            return default_crf
+        try:
+            crf = int(crf_input)
+            if 0 <= crf <= max_crf:
+                return crf
+            print(f"错误: CRF 范围为 0~{max_crf}，请重新输入")
+        except ValueError:
+            print("错误: 请输入有效数字")
+
+
+def build_video_codec_args(
+    codec: str, lossless: bool, crf: int, encoder: str, gpu: str
+) -> list:
+    """根据编码模式返回视频编码参数列表。"""
+    if codec == "copy":
+        return ["-c:v", "copy"]
+
+    args = ["-c:v", encoder]
+
+    # H.265 编码参数
+    if codec == "h265":
+        if gpu == "cpu":
+            # libx265 软件编码
+            args += ["-crf", str(crf), "-preset", "medium"]
+        elif gpu == "nvidia":
+            # NVENC 硬件编码
+            # NVENC 使用 -cq 代替 -crf，范围 0-51
+            args += ["-rc", "vbr", "-cq", str(crf), "-preset", "p4"]
+        elif gpu == "amd":
+            # AMF 硬件编码
+            args += ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf)]
+        elif gpu == "intel":
+            # QSV 硬件编码
+            args += ["-global_quality", str(crf), "-preset", "medium"]
+
+    # AV1 编码参数
+    elif codec == "av1":
+        if lossless:
+            if encoder == "libsvtav1":
+                args += ["-svtav1-params", "lossless=1"]
+            elif encoder == "libaom-av1":
+                args += ["-lossless", "1"]
+            elif encoder == "librav1e":
+                args += ["-qp", "0"]
+            elif gpu == "nvidia":
+                # NVENC AV1 不支持真正无损，使用最高质量
+                args += ["-rc", "constqp", "-qp", "0"]
+            else:
+                args += ["-crf", "0"]
+        else:
+            if gpu == "cpu":
+                args += ["-crf", str(crf)]
+                if encoder == "libsvtav1":
+                    args += ["-preset", "6"]
+                elif encoder == "libaom-av1":
+                    args += ["-cpu-used", "4", "-row-mt", "1"]
+            elif gpu == "nvidia":
+                args += ["-rc", "vbr", "-cq", str(crf), "-preset", "p4"]
+            elif gpu == "amd":
+                args += ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf)]
+            elif gpu == "intel":
+                args += ["-global_quality", str(crf), "-preset", "medium"]
+
+    return args
 
 
 def auto_merge_mode() -> None:
@@ -192,84 +415,63 @@ def auto_merge_mode() -> None:
         print(f"      视频: {video.name}")
         print(f"      音频: {audio.name}")
 
-    # 确认是否继续
     confirm = input("\n是否继续合并？[Y/n]: ").strip().lower()
     if confirm == "n":
         print("已取消")
         sys.exit(0)
 
+    # 检测可用编码器和 GPU
+    print("\n正在检测系统编码器和 GPU...")
+    available_encoders = get_available_encoders()
+    gpus = detect_gpus()
+
+    print("检测到的 GPU:")
+    for gpu_type, gpu_name in gpus:
+        print(f"  - {GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}")
+
     # 选择编码方式
-    av1, lossless, crf = prompt_encoding_choice()
+    codec, lossless, crf, gpu, encoder = prompt_encoding_choice(
+        available_encoders, gpus
+    )
 
     # 执行合并
     for video, audio, output in pairs:
         print(f"\n{'='*60}")
         print(f"正在合并: {output.name}")
-        merge(str(video), str(audio), str(output), av1, lossless, crf)
+        merge(str(video), str(audio), str(output), codec, lossless, crf, gpu, encoder)
 
     print(f"\n{'='*60}")
     print(f"全部完成！共合并 {len(pairs)} 个文件")
-
-
-def detect_av1_encoder() -> str:
-    """检测当前 ffmpeg 支持的 AV1 编码器，返回第一个可用的。"""
-    result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
-    for enc in AV1_ENCODERS:
-        if enc in result.stdout:
-            return enc
-    sys.exit(
-        "错误: 当前 ffmpeg 不支持任何 AV1 编码器。\n"
-        "请安装包含 libsvtav1 或 libaom-av1 支持的 ffmpeg 版本。\n"
-        "下载地址: https://ffmpeg.org/download.html"
-    )
-
-
-def build_video_codec_args(av1: bool, lossless: bool, crf: int, encoder: str) -> list:
-    """根据编码模式返回视频编码参数列表。"""
-    if not av1:
-        return ["-c:v", "copy"]
-
-    args = ["-c:v", encoder]
-
-    if lossless:
-        if encoder == "libsvtav1":
-            # SVT-AV1 通过 --lossless 1 实现无损
-            args += ["-svtav1-params", "lossless=1"]
-        elif encoder == "libaom-av1":
-            args += ["-lossless", "1"]
-        elif encoder == "librav1e":
-            args += ["-qp", "0"]
-    else:
-        # CRF 模式：视觉无损推荐 0-23，默认 23
-        args += ["-crf", str(crf)]
-        if encoder == "libsvtav1":
-            # SVT-AV1 需要同时指定 -preset（0=最慢最好 ~ 13=最快）
-            args += ["-preset", "6"]
-        elif encoder == "libaom-av1":
-            # libaom 默认速度极慢，-cpu-used 控制速度（0=最慢 ~ 8=最快）
-            args += ["-cpu-used", "4", "-row-mt", "1"]
-
-    return args
 
 
 def merge(
     video_path: str,
     audio_path: str,
     output_path: str,
-    av1: bool,
+    codec: str,
     lossless: bool,
     crf: int,
+    gpu: str = "cpu",
+    encoder: str = "",
 ) -> None:
+    """执行音视频合并。"""
     for p in (video_path, audio_path):
         if not Path(p).is_file():
             sys.exit(f"错误: 文件不存在 -> {p}")
 
-    encoder = detect_av1_encoder() if av1 else ""
-    video_codec_args = build_video_codec_args(av1, lossless, crf, encoder)
+    # 如果未指定编码器，自动检测
+    if codec != "copy" and not encoder:
+        available = get_available_encoders()
+        encoder = detect_encoder(codec, gpu, available)
+        if not encoder:
+            sys.exit(f"错误: 未找到支持 {codec.upper()} 的编码器")
 
-    if av1:
-        mode = "真正无损" if lossless else f"视觉无损 (CRF={crf})"
-        print(f"AV1 编码模式: {mode}，编码器: {encoder}")
+    video_codec_args = build_video_codec_args(codec, lossless, crf, encoder, gpu)
+
+    if codec != "copy":
+        mode = "真正无损" if lossless else f"CRF={crf}"
+        print(f"编码模式: {codec.upper()} {mode}")
+        print(f"编码器: {encoder} ({GPU_NAMES.get(gpu, gpu)})")
 
     cmd = [
         "ffmpeg",
@@ -279,11 +481,11 @@ def merge(
         audio_path,
         *video_codec_args,
         "-c:a",
-        "copy",  # 音频流直接复制
+        "copy",
         "-map",
-        "0:v:0",  # 取第一个输入的视频流
+        "0:v:0",
         "-map",
-        "1:a:0",  # 取第二个输入的音频流
+        "1:a:0",
         "-y",
         output_path,
     ]
@@ -311,36 +513,96 @@ def main() -> None:
     parser.add_argument("audio", nargs="?", help="纯音频 MP4 文件路径")
     parser.add_argument("output", nargs="?", help="输出 MP4 文件路径")
     parser.add_argument(
+        "--h265",
+        action="store_true",
+        help="使用 H.265/HEVC 编码视频",
+    )
+    parser.add_argument(
         "--av1",
         action="store_true",
-        help="使用 AV1 编码视频以减小文件体积（默认: 直接复制流）",
+        help="使用 AV1 编码视频以减小文件体积",
+    )
+    parser.add_argument(
+        "--gpu",
+        choices=["nvidia", "amd", "intel", "cpu"],
+        default=None,
+        help="指定用于编码的 GPU（默认: 自动选择独立显卡）",
     )
     parser.add_argument(
         "--lossless",
         action="store_true",
-        help="AV1 真正无损编码（需配合 --av1 使用，文件体积大于 CRF 模式）",
+        help="真正无损编码（需配合 --av1 使用）",
     )
     parser.add_argument(
         "--crf",
         type=int,
         default=23,
         metavar="N",
-        help="AV1 CRF 质量值，范围 0（无损）~ 63（最差），默认 23（视觉无损）",
+        help="CRF 质量值，H.265 范围 0~51，AV1 范围 0~63，默认 23",
     )
     args = parser.parse_args()
 
     # 检查必需参数
     if not all([args.video, args.audio, args.output]):
         parser.error(
-            "手动模式需要提供 video、audio 和 output 三个参数，或不提供参数进入自动检测模式"
+            "手动模式需要提供 video、audio 和 output 三个参数，"
+            "或不提供参数进入自动检测模式"
         )
 
+    if args.h265 and args.av1:
+        parser.error("--h265 和 --av1 不能同时使用")
     if args.lossless and not args.av1:
         parser.error("--lossless 需要配合 --av1 一起使用")
-    if not (0 <= args.crf <= 63):
-        parser.error("--crf 范围为 0 ~ 63")
 
-    merge(args.video, args.audio, args.output, args.av1, args.lossless, args.crf)
+    # 确定编码类型
+    if args.h265:
+        codec = "h265"
+        if not (0 <= args.crf <= 51):
+            parser.error("H.265 的 --crf 范围为 0 ~ 51")
+    elif args.av1:
+        codec = "av1"
+        if not (0 <= args.crf <= 63):
+            parser.error("AV1 的 --crf 范围为 0 ~ 63")
+    else:
+        codec = "copy"
+
+    # 检测编码器和 GPU
+    gpu = args.gpu
+    encoder = ""
+
+    if codec != "copy":
+        available = get_available_encoders()
+        gpus = detect_gpus()
+
+        if gpu is None:
+            # 自动选择最优 GPU
+            for gpu_type, _ in gpus:
+                enc = detect_encoder(codec, gpu_type, available)
+                if enc:
+                    gpu = gpu_type
+                    encoder = enc
+                    break
+        else:
+            encoder = detect_encoder(codec, gpu, available)
+
+        if not encoder:
+            sys.exit(
+                f"错误: 未找到支持 {codec.upper()} 的编码器。\n"
+                f"尝试的 GPU: {gpu or '自动检测'}"
+            )
+
+        print(f"使用编码器: {encoder} ({GPU_NAMES.get(gpu, gpu)})")
+
+    merge(
+        args.video,
+        args.audio,
+        args.output,
+        codec,
+        args.lossless,
+        args.crf,
+        gpu or "cpu",
+        encoder,
+    )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,21 @@
 # merge_av
 
 将两个分离的 MP4 文件（一个仅含视频、一个仅含音频）合并为单个含音视频的 MP4。
-支持直接流复制（默认）或 AV1 重编码以大幅减小文件体积。
+支持直接流复制（默认）、H.265 或 AV1 重编码，**支持 GPU 硬件加速**。
 
 ## 依赖
 
 - Python 3.7+
-- [ffmpeg](https://ffmpeg.org/download.html)（需已安装并加入系统 PATH，且包含 AV1 编码器）
+- [ffmpeg](https://ffmpeg.org/download.html)（需已安装并加入系统 PATH）
+
+## 支持的编码器
+
+| 类型 | H.265/HEVC | AV1 |
+|------|------------|-----|
+| **NVIDIA** (NVENC) | `hevc_nvenc` | `av1_nvenc` |
+| **AMD** (AMF) | `hevc_amf` | `av1_amf` |
+| **Intel** (QSV) | `hevc_qsv` | `av1_qsv` |
+| **CPU** (软件) | `libx265` | `libsvtav1` / `libaom-av1` |
 
 ## 用法
 
@@ -22,8 +31,9 @@ python merge_av.py
 
 1. 扫描当前目录，检测符合 B站等平台命名格式的文件配对
 2. 列出检测到的视频/音频配对
-3. 交互式提示选择编码方式
-4. 批量执行合并
+3. **交互式选择编码方式**（直接复制 / H.265 / AV1）
+4. **交互式选择 GPU**（默认优先使用独立显卡）
+5. 批量执行合并
 
 支持的文件命名格式：`<前缀>-<流ID>.mp4`，例如：
 
@@ -39,21 +49,35 @@ python merge_av.py <video.mp4> <audio.mp4> <output.mp4> [选项]
 | 选项 | 说明 |
 |------|------|
 | _(无)_ | 直接复制流，最快，零质量损失 |
-| `--av1` | AV1 视觉无损编码（CRF=23），体积比 H.264 小 ~50% |
+| `--h265` | H.265/HEVC 编码（兼容性好） |
+| `--av1` | AV1 编码（体积最小） |
 | `--av1 --lossless` | AV1 数学意义上的真正无损编码 |
-| `--av1 --crf N` | 自定义质量，**0**=无损，**23**=默认，**63**=最差 |
+| `--crf N` | 自定义质量，H.265: **0~51**，AV1: **0~63**，默认 **23** |
+| `--gpu nvidia` | 使用 NVIDIA GPU 加速 |
+| `--gpu amd` | 使用 AMD GPU 加速 |
+| `--gpu intel` | 使用 Intel 核显加速 |
+| `--gpu cpu` | 强制使用 CPU 软件编码 |
 
 ## 示例
 
 ```bash
-# 自动检测并合并（交互式选择编码）
+# 自动检测并合并（交互式选择编码和 GPU）
 python merge_av.py
 
 # 直接合并（不重编码）
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4
 
+# H.265 编码（自动选择最佳 GPU）
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --h265
+
+# H.265 编码，指定使用 NVIDIA GPU
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --h265 --gpu nvidia
+
 # AV1 视觉无损（推荐，体积最小）
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1
+
+# AV1 编码，使用 AMD GPU 加速
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --gpu amd
 
 # AV1 真正无损
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --lossless
@@ -62,14 +86,28 @@ python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --lossless
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --crf 18
 ```
 
-## AV1 编码说明
+## GPU 加速说明
 
-程序会按优先级自动选择可用的 AV1 编码器：
+程序会自动检测系统中的显卡，并按以下优先级选择：
 
-| 编码器 | 特点 |
-|--------|------|
-| `libsvtav1` | 速度快（推荐），Meta/Intel 出品 |
-| `libaom-av1` | 压缩率最高，但速度慢 |
-| `librav1e` | Xiph 出品，折中方案 |
+1. **NVIDIA** (NVENC) - 速度快，质量好
+2. **AMD** (AMF) - 速度快
+3. **Intel** (QSV) - 集成显卡加速
+4. **CPU** (软件编码) - 兼容性最好，但速度较慢
 
-> **提示：** CRF 0~23 通常视觉无损，相比 H.264 体积减少 40~60%，编码时间较长属正常现象。
+> **提示：** 硬件加速编码速度通常是软件编码的 5-10 倍，但压缩率略低。
+> 追求最小体积请使用 CPU 软件编码；追求速度请使用 GPU 硬件加速。
+
+## 编码格式对比
+
+| 格式 | 压缩率 | 兼容性 | 编码速度 |
+|------|--------|--------|----------|
+| **直接复制** | - | 最好 | 最快 |
+| **H.265/HEVC** | 好 | 好 | 中等 |
+| **AV1** | 最好 | 一般 | 较慢 |
+
+> **推荐：**
+>
+> - 只需合并不重编码 → 直接复制
+> - 需要广泛兼容性 → H.265
+> - 追求最小体积 → AV1
