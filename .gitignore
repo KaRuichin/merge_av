@@ -1,3 +1,6 @@
-/36502112568-1-30116.mp4
-/36502112568-1-30280.mp4
-/36502112568-1.mp4
+# Media files
+*.mp4
+
+# Python cache files
+__pycache__/
+*.pyc
