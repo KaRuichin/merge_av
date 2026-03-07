@@ -571,6 +571,30 @@ def merge(
 
     print(f"\n合并完成 -> {output_path}")
 
+    # 重编码时显示大小对比
+    if codec != "copy":
+        src_size = Path(video_path).stat().st_size + Path(audio_path).stat().st_size
+        out_size = Path(output_path).stat().st_size
+        ratio = (1 - out_size / src_size) * 100 if src_size else 0
+
+        def _fmt_size(n: int) -> str:
+            for unit in ("B", "KB", "MB", "GB"):
+                if abs(n) < 1024:
+                    return f"{n:.2f} {unit}"
+                n /= 1024
+            return f"{n:.2f} TB"
+
+        # ANSI 颜色: 绿色=压缩, 红色=膨胀
+        color = "\033[32m" if ratio > 0 else "\033[31m"
+        reset = "\033[0m"
+
+        print(f"\n  编码前大小: {_fmt_size(src_size)}")
+        print(f"  编码后大小: {_fmt_size(out_size)}")
+        if ratio > 0:
+            print(f"  压缩率:     {color}-{ratio:.1f}%{reset}")
+        else:
+            print(f"  体积变化:   {color}+{abs(ratio):.1f}%{reset}")
+
 
 def main() -> None:
     # 若无参数，进入自动检测模式
