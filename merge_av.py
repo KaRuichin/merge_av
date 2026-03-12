@@ -21,15 +21,20 @@ merge_av.py
 
     # AV1 自定义质量（CRF 0=无损 ~ 63=最差，默认 23）
     python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --av1 --crf 28
+
+    # 智能优化模式（自动试压，选“满足质量阈值下最小体积”的方案）
+    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --auto-optimize
 """
 
 import argparse
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 _has_inquirerpy = False
 try:
@@ -86,6 +91,23 @@ VIDEO_STREAM_IDS = {
     "30016",
 }
 AUDIO_STREAM_IDS = {"30280", "30232", "30216", "30250", "30251"}
+
+
+QualityMetric = Literal["ssim", "vmaf"]
+OptimizePreset = Literal["fast", "balanced", "quality"]
+
+
+@dataclass(frozen=True)
+class EncodeCandidate:
+    codec: str
+    gpu: str
+    encoder: str
+    crf: int
+    lossless: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.codec.upper()} | {self.encoder} | CRF={self.crf}"
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +366,7 @@ def prompt_encoding_choice(
     """
     choices = [
         ("直接复制（最快，零质量损失）", "copy"),
+        ("智能优化（采样评估后自动选最优）", "auto_opt"),
         ("H.265/HEVC 编码（兼容性好，体积小）", "h265"),
         ("H.265/HEVC 自定义 CRF 值", "h265_crf"),
         ("AV1 视觉无损编码（CRF=23，体积最小）", "av1"),
@@ -355,6 +378,8 @@ def prompt_encoding_choice(
 
     if result == "copy":
         return "copy", False, 23, "cpu", "copy"
+    elif result == "auto_opt":
+        return "auto_opt", False, 23, "cpu", ""
     elif result == "h265":
         gpu, encoder = prompt_gpu_choice("h265", available_encoders, gpus)
         return "h265", False, 23, gpu, encoder
@@ -483,6 +508,307 @@ def build_video_codec_args(
     return args
 
 
+def get_media_duration(path: str) -> float:
+    """通过 ffprobe 获取媒体时长（秒）。"""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return 0.0
+    try:
+        return max(0.0, float(result.stdout.strip()))
+    except ValueError:
+        return 0.0
+
+
+def has_libvmaf() -> bool:
+    """检测 ffmpeg 是否包含 libvmaf 滤镜。"""
+    result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
+    return result.returncode == 0 and "libvmaf" in result.stdout
+
+
+def choose_sample_starts(
+    duration: float, sample_count: int, sample_seconds: int
+) -> list[float]:
+    """根据视频时长选取采样起点，均匀覆盖头中尾。"""
+    if duration <= sample_seconds + 1:
+        return [0.0]
+
+    usable = max(0.0, duration - sample_seconds)
+    if sample_count <= 1:
+        return [usable / 2.0]
+
+    step = usable / (sample_count + 1)
+    return [step * (i + 1) for i in range(sample_count)]
+
+
+def parse_quality_score(output: str, metric: QualityMetric) -> Optional[float]:
+    """从 ffmpeg 输出中解析质量分数。"""
+    if metric == "ssim":
+        match = re.search(r"All:(\d+(?:\.\d+)?)", output)
+    else:
+        match = re.search(r"VMAF score:\s*(\d+(?:\.\d+)?)", output)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def measure_segment_quality(
+    source_video: str,
+    encoded_video: str,
+    start_time: float,
+    duration: int,
+    metric: QualityMetric,
+) -> Optional[float]:
+    """对单个片段计算质量分数（SSIM 或 VMAF）。"""
+    lavfi = "ssim" if metric == "ssim" else "libvmaf=n_threads=4"
+    cmd = [
+        "ffmpeg",
+        "-ss",
+        f"{start_time:.3f}",
+        "-t",
+        str(duration),
+        "-i",
+        source_video,
+        "-i",
+        encoded_video,
+        "-lavfi",
+        lavfi,
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return parse_quality_score(result.stderr + "\n" + result.stdout, metric)
+
+
+def build_optimization_candidates(
+    available_encoders: dict[str, dict[str, str]],
+    gpus: list[tuple[str, str]],
+    preset: OptimizePreset,
+) -> list[EncodeCandidate]:
+    """构建自动试压候选列表。"""
+    candidates: list[EncodeCandidate] = []
+    if preset == "fast":
+        crf_ladder: dict[str, list[int]] = {
+            "h265": [30, 26, 22],
+            "av1": [36, 30, 24],
+        }
+    elif preset == "quality":
+        crf_ladder = {
+            "h265": [32, 30, 28, 26, 24, 22, 20],
+            "av1": [40, 36, 32, 28, 24, 20, 16],
+        }
+    else:
+        crf_ladder = {
+            "h265": [30, 28, 26, 24, 22],
+            "av1": [36, 32, 28, 24, 20],
+        }
+
+    for codec in ("h265", "av1"):
+        for gpu_type, _ in gpus:
+            encoder = detect_encoder(codec, gpu_type, available_encoders)
+            if not encoder:
+                continue
+            for crf in crf_ladder[codec]:
+                candidates.append(
+                    EncodeCandidate(
+                        codec=codec,
+                        gpu=gpu_type,
+                        encoder=encoder,
+                        crf=crf,
+                        lossless=False,
+                    )
+                )
+
+    return candidates
+
+
+def evaluate_candidate(
+    video_path: str,
+    candidate: EncodeCandidate,
+    sample_starts: list[float],
+    sample_seconds: int,
+    metric: QualityMetric,
+) -> tuple[Optional[float], Optional[int]]:
+    """评估候选方案：返回平均质量分和采样总字节数。"""
+    if not sample_starts:
+        return None, None
+
+    with tempfile.TemporaryDirectory(prefix="merge_av_opt_") as tmp_dir:
+        total_quality = 0.0
+        total_size = 0
+
+        for idx, start in enumerate(sample_starts, start=1):
+            segment_out = Path(tmp_dir) / f"seg_{idx}.mp4"
+            video_codec_args = build_video_codec_args(
+                candidate.codec,
+                candidate.lossless,
+                candidate.crf,
+                candidate.encoder,
+                candidate.gpu,
+            )
+            encode_cmd = [
+                "ffmpeg",
+                "-ss",
+                f"{start:.3f}",
+                "-t",
+                str(sample_seconds),
+                "-i",
+                video_path,
+                *video_codec_args,
+                "-an",
+                "-y",
+                str(segment_out),
+            ]
+
+            encode_result = subprocess.run(encode_cmd, capture_output=True, text=True)
+            if encode_result.returncode != 0 or not segment_out.exists():
+                return None, None
+
+            quality = measure_segment_quality(
+                video_path,
+                str(segment_out),
+                start,
+                sample_seconds,
+                metric,
+            )
+            if quality is None:
+                return None, None
+
+            total_quality += quality
+            total_size += segment_out.stat().st_size
+
+        return total_quality / len(sample_starts), total_size
+
+
+def auto_optimize_and_merge(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    available_encoders: dict[str, dict[str, str]],
+    gpus: list[tuple[str, str]],
+    preset: OptimizePreset,
+    metric: QualityMetric,
+    quality_threshold: Optional[float],
+    sample_seconds: int,
+    sample_count: int,
+    min_saving: float,
+) -> None:
+    """自动试压并在质量达标前提下选择最小体积方案。"""
+    src_video_size = Path(video_path).stat().st_size
+    src_audio_size = Path(audio_path).stat().st_size
+    src_total_size = src_video_size + src_audio_size
+
+    video_duration = get_media_duration(video_path)
+    if video_duration <= 0:
+        print("警告: 无法读取视频时长，回退为直接复制。")
+        merge(video_path, audio_path, output_path, "copy", False, 23, "cpu", "copy")
+        return
+
+    selected_metric: QualityMetric = metric
+    if metric == "vmaf" and not has_libvmaf():
+        print("警告: 当前 ffmpeg 未检测到 libvmaf，已自动回退为 SSIM。")
+        selected_metric = "ssim"
+
+    threshold = quality_threshold
+    if threshold is None:
+        threshold = 0.99 if selected_metric == "ssim" else 95.0
+
+    sample_starts = choose_sample_starts(video_duration, sample_count, sample_seconds)
+    candidates = build_optimization_candidates(available_encoders, gpus, preset)
+    if not candidates:
+        print("警告: 未找到可用重编码候选，回退为直接复制。")
+        merge(video_path, audio_path, output_path, "copy", False, 23, "cpu", "copy")
+        return
+
+    print("\n开始智能试压评估...")
+    print(f"优化预设: {preset}")
+    print(f"质量指标: {selected_metric.upper()} | 阈值: {threshold}")
+    print(f"采样片段: {len(sample_starts)} 段，每段 {sample_seconds}s")
+    print(f"候选方案: {len(candidates)} 个")
+
+    best_candidate: Optional[EncodeCandidate] = None
+    best_estimated_size = src_total_size
+    best_quality = 0.0
+    total_sample_seconds = max(len(sample_starts) * sample_seconds, 1)
+
+    for idx, candidate in enumerate(candidates, start=1):
+        print(f"\n[{idx}/{len(candidates)}] 评估: {candidate.label}")
+        quality, sample_bytes = evaluate_candidate(
+            video_path,
+            candidate,
+            sample_starts,
+            sample_seconds,
+            selected_metric,
+        )
+
+        if quality is None or sample_bytes is None:
+            print("  -> 评估失败，跳过")
+            continue
+
+        est_video_size = int(sample_bytes / total_sample_seconds * video_duration)
+        est_total_size = est_video_size + src_audio_size
+        saving_ratio = (
+            (1 - est_total_size / src_total_size) * 100 if src_total_size else 0
+        )
+
+        print(
+            f"  -> {selected_metric.upper()}={quality:.4f}, 预计体积变化={saving_ratio:+.1f}%"
+        )
+
+        if quality >= threshold and est_total_size < best_estimated_size:
+            best_candidate = candidate
+            best_estimated_size = est_total_size
+            best_quality = quality
+
+    best_saving = (
+        (1 - best_estimated_size / src_total_size) * 100 if src_total_size else 0
+    )
+    if best_candidate is None:
+        print("\n未找到达到质量阈值的重编码方案，使用直接复制。")
+        merge(video_path, audio_path, output_path, "copy", False, 23, "cpu", "copy")
+        return
+
+    if best_saving < min_saving:
+        print(
+            f"\n最佳方案预计仅节省 {best_saving:.1f}%（低于阈值 {min_saving:.1f}%），使用直接复制。"
+        )
+        merge(video_path, audio_path, output_path, "copy", False, 23, "cpu", "copy")
+        return
+
+    print("\n智能优化结果:")
+    print(f"  方案: {best_candidate.label}")
+    print(f"  指标: {selected_metric.upper()}={best_quality:.4f}")
+    print(f"  预计节省: {best_saving:.1f}%")
+
+    merge(
+        video_path,
+        audio_path,
+        output_path,
+        best_candidate.codec,
+        best_candidate.lossless,
+        best_candidate.crf,
+        best_candidate.gpu,
+        best_candidate.encoder,
+    )
+
+
 def auto_merge_mode() -> None:
     """自动检测模式：扫描当前目录并合并检测到的音视频配对。"""
     script_dir = Path(__file__).parent
@@ -524,7 +850,31 @@ def auto_merge_mode() -> None:
     for video, audio, output in pairs:
         print(f"\n{'='*60}")
         print(f"正在合并: {output.name}")
-        merge(str(video), str(audio), str(output), codec, lossless, crf, gpu, encoder)
+        if codec == "auto_opt":
+            auto_optimize_and_merge(
+                str(video),
+                str(audio),
+                str(output),
+                available_encoders,
+                gpus,
+                preset="balanced",
+                metric="ssim",
+                quality_threshold=0.99,
+                sample_seconds=12,
+                sample_count=3,
+                min_saving=5.0,
+            )
+        else:
+            merge(
+                str(video),
+                str(audio),
+                str(output),
+                codec,
+                lossless,
+                crf,
+                gpu,
+                encoder,
+            )
 
     print(f"\n{'='*60}")
     print(f"全部完成！共合并 {len(pairs)} 个文件")
@@ -650,6 +1000,47 @@ def main() -> None:
         metavar="N",
         help="CRF 质量值，H.265 范围 0~51，AV1 范围 0~63，默认 23",
     )
+    parser.add_argument(
+        "--auto-optimize",
+        action="store_true",
+        help="智能优化模式：自动试压并选择满足质量阈值下体积最小的方案",
+    )
+    parser.add_argument(
+        "--optimize-preset",
+        choices=["fast", "balanced", "quality"],
+        default="balanced",
+        help="智能优化预设：fast（更快）/balanced（平衡）/quality（更稳）",
+    )
+    parser.add_argument(
+        "--quality-metric",
+        choices=["ssim", "vmaf"],
+        default="ssim",
+        help="智能优化的质量指标（默认: ssim）",
+    )
+    parser.add_argument(
+        "--quality-threshold",
+        type=float,
+        default=None,
+        help="智能优化的质量阈值（SSIM 默认 0.99，VMAF 默认 95）",
+    )
+    parser.add_argument(
+        "--sample-seconds",
+        type=int,
+        default=None,
+        help="智能优化每段采样时长（秒，默认由 --optimize-preset 决定）",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=None,
+        help="智能优化采样段数量（默认由 --optimize-preset 决定）",
+    )
+    parser.add_argument(
+        "--min-saving",
+        type=float,
+        default=None,
+        help="智能优化最小节省阈值（%%，低于此值则回退 copy，默认由预设决定）",
+    )
     args = parser.parse_args()
 
     # 检查必需参数
@@ -663,6 +1054,48 @@ def main() -> None:
         parser.error("--h265 和 --av1 不能同时使用")
     if args.lossless and not args.av1:
         parser.error("--lossless 需要配合 --av1 一起使用")
+    if args.auto_optimize and (args.h265 or args.av1 or args.lossless):
+        parser.error("--auto-optimize 不能与 --h265/--av1/--lossless 同时使用")
+    if (
+        args.auto_optimize
+        and args.sample_seconds is not None
+        and args.sample_seconds <= 0
+    ):
+        parser.error("--sample-seconds 必须大于 0")
+    if args.auto_optimize and args.sample_count is not None and args.sample_count <= 0:
+        parser.error("--sample-count 必须大于 0")
+    if args.auto_optimize and args.min_saving is not None and args.min_saving < 0:
+        parser.error("--min-saving 不能小于 0")
+
+    if args.auto_optimize:
+        preset_defaults: dict[str, tuple[int, int, float]] = {
+            "fast": (8, 2, 3.0),
+            "balanced": (12, 3, 5.0),
+            "quality": (18, 5, 2.0),
+        }
+        default_seconds, default_count, default_saving = preset_defaults[
+            args.optimize_preset
+        ]
+        sample_seconds = args.sample_seconds or default_seconds
+        sample_count = args.sample_count or default_count
+        min_saving = args.min_saving if args.min_saving is not None else default_saving
+
+        available = get_available_encoders()
+        gpus = detect_gpus()
+        auto_optimize_and_merge(
+            args.video,
+            args.audio,
+            args.output,
+            available,
+            gpus,
+            preset=args.optimize_preset,
+            metric=args.quality_metric,
+            quality_threshold=args.quality_threshold,
+            sample_seconds=sample_seconds,
+            sample_count=sample_count,
+            min_saving=min_saving,
+        )
+        return
 
     # 确定编码类型
     if args.h265:
