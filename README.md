@@ -1,7 +1,7 @@
 # merge_av
 
 将两个分离的 MP4 文件（一个仅含视频、一个仅含音频）合并为单个含音视频的 MP4。
-支持直接流复制（默认）、H.265 或 AV1 重编码，**支持 GPU 硬件加速**。
+支持直接流复制（默认）、H.265 或 AV1 重编码，**支持 GPU 硬件加速**，并提供**智能优化（自动试压）**模式。
 
 ## 依赖
 
@@ -38,7 +38,7 @@ python merge_av.py
 
 1. 扫描当前目录，检测符合 B站等平台命名格式的文件配对
 2. 列出检测到的视频/音频配对
-3. **交互式选择编码方式**（直接复制 / H.265 / AV1）
+3. **交互式选择编码方式**（直接复制 / 智能优化 / H.265 / AV1）
 4. **交互式选择 GPU**（默认优先使用独立显卡）
 5. 批量执行合并
 
@@ -61,20 +61,41 @@ python merge_av.py <video.mp4> <audio.mp4> <output.mp4> [选项]
 | 选项 | 说明 |
 |------|------|
 | _(无)_ | 直接复制流，最快，零质量损失 |
+| `--auto-optimize` | 智能优化：自动试压并选择满足质量阈值下体积最小的方案 |
 | `--h265` | H.265/HEVC 编码（兼容性好） |
 | `--av1` | AV1 编码（体积最小） |
 | `--av1 --lossless` | AV1 数学意义上的真正无损编码 |
+| `--optimize-preset {fast,balanced,quality}` | 智能优化预设：快 / 平衡 / 高精度（默认 balanced） |
+| `--quality-metric {ssim,vmaf}` | 智能优化质量指标（默认 ssim） |
+| `--quality-threshold N` | 自定义质量阈值（SSIM 默认 0.99，VMAF 默认 95） |
+| `--sample-seconds N` | 每段采样时长（默认由预设决定） |
+| `--sample-count N` | 采样段数量（默认由预设决定） |
+| `--min-saving N` | 最小节省阈值 %（低于此值回退 copy，默认由预设决定） |
 | `--crf N` | 自定义质量，H.265: **0~51**，AV1: **0~63**，默认 **23** |
 | `--gpu nvidia` | 使用 NVIDIA GPU 加速 |
 | `--gpu amd` | 使用 AMD GPU 加速 |
 | `--gpu intel` | 使用 Intel 核显加速 |
 | `--gpu cpu` | 强制使用 CPU 软件编码 |
 
+> 约束：`--auto-optimize` 不能与 `--h265 / --av1 / --lossless` 同时使用。
+
 ## 示例
 
 ```bash
 # 自动检测并合并（交互式选择编码和 GPU）
 python merge_av.py
+
+# 智能优化（自动试压，默认平衡预设）
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --auto-optimize
+
+# 智能优化（快速预设，优先速度）
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --auto-optimize --optimize-preset fast
+
+# 智能优化（高精度预设，优先效果）
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --auto-optimize --optimize-preset quality
+
+# 智能优化 + 更严格 SSIM 阈值
+python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --auto-optimize --quality-metric ssim --quality-threshold 0.995
 
 # 直接合并（不重编码）
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4
@@ -97,6 +118,24 @@ python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --lossless
 # AV1 自定义质量（值越小质量越高）
 python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --crf 18
 ```
+
+## 智能优化说明
+
+智能优化模式会：
+
+1. 根据可用编码器构建候选方案（H.265/AV1 + 多组 CRF）
+2. 在视频多个采样片段上进行试编码
+3. 计算质量指标（`SSIM` 或 `VMAF`）
+4. 在“质量达到阈值”的候选中选择预计体积最小者
+5. 如果预计节省低于 `--min-saving`，自动回退为 `copy`
+
+预设默认参数：
+
+- `fast`：`sample-seconds=8`，`sample-count=2`，`min-saving=3`
+- `balanced`：`sample-seconds=12`，`sample-count=3`，`min-saving=5`
+- `quality`：`sample-seconds=18`，`sample-count=5`，`min-saving=2`
+
+> 使用 `--quality-metric vmaf` 时，如果当前 ffmpeg 未包含 `libvmaf`，程序会自动回退到 `SSIM`。
 
 ## GPU 加速说明
 
