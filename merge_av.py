@@ -29,15 +29,16 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+_has_inquirerpy = False
 try:
     from InquirerPy import inquirer as inq
     from InquirerPy.base.control import Choice
 
-    INTERACTIVE_UI = True
+    _has_inquirerpy = True
 except ImportError:
-    INTERACTIVE_UI = False
+    pass
 
 # 编码器配置
 # 格式: {gpu_type: {codec: [encoder_list]}}
@@ -92,7 +93,9 @@ AUDIO_STREAM_IDS = {"30280", "30232", "30216", "30250", "30251"}
 # ---------------------------------------------------------------------------
 
 
-def interactive_select(message: str, choices: list, default_index: int = 0):
+def interactive_select(
+    message: str, choices: list[tuple[str, Any]], default_index: int = 0
+) -> Any:
     """
     交互式选择菜单。
     - 安装了 InquirerPy 时: 支持 ↑↓ 方向键、数字键快速跳转。
@@ -100,12 +103,12 @@ def interactive_select(message: str, choices: list, default_index: int = 0):
     choices: [(显示文本, 返回值), ...]
     返回选中项的值。
     """
-    if INTERACTIVE_UI:
-        choice_objs = [
-            Choice(value=val, name=f" {i + 1}. {name}")
+    if _has_inquirerpy:
+        choice_objs: list[Any] = [
+            Choice(value=val, name=f" {i + 1}. {name}")  # type: ignore[possibly-undefined]
             for i, (name, val) in enumerate(choices)
         ]
-        prompt = inq.select(
+        prompt: Any = inq.select(  # type: ignore[possibly-undefined]
             message=message,
             choices=choice_objs,
             default=(
@@ -118,8 +121,8 @@ def interactive_select(message: str, choices: list, default_index: int = 0):
         # 注册数字键 1-9 快捷跳转
         for idx in range(min(len(choices), 9)):
 
-            def _make_handler(target):
-                def _handler(event):
+            def _make_handler(target: int) -> Any:
+                def _handler(event: Any) -> None:
                     prompt.content_control.selected_choice_index = target
 
                 return _handler
@@ -150,8 +153,8 @@ def interactive_select(message: str, choices: list, default_index: int = 0):
 
 def interactive_confirm(message: str, default: bool = True) -> bool:
     """交互式确认提示。"""
-    if INTERACTIVE_UI:
-        return inq.confirm(message=message, default=default).execute()
+    if _has_inquirerpy:
+        return inq.confirm(message=message, default=default).execute()  # type: ignore[possibly-undefined]
     suffix = "[Y/n]" if default else "[y/N]"
     result = input(f"{message} {suffix}: ").strip().lower()
     if result == "":
@@ -161,9 +164,9 @@ def interactive_confirm(message: str, default: bool = True) -> bool:
 
 def interactive_number(message: str, default: int, min_val: int, max_val: int) -> int:
     """交互式数字输入。"""
-    if INTERACTIVE_UI:
+    if _has_inquirerpy:
         return int(
-            inq.number(
+            inq.number(  # type: ignore[possibly-undefined]
                 message=message,
                 default=default,
                 min_allowed=min_val,
@@ -184,12 +187,12 @@ def interactive_number(message: str, default: int, min_val: int, max_val: int) -
             print("错误: 请输入有效数字")
 
 
-def get_available_encoders() -> dict:
+def get_available_encoders() -> dict[str, dict[str, str]]:
     """检测 ffmpeg 支持的所有编码器，返回可用编码器字典。"""
     result = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
     output = result.stdout
 
-    available = {}
+    available: dict[str, dict[str, str]] = {}
     for gpu_type, codecs in ENCODERS.items():
         available[gpu_type] = {}
         for codec, encoder_list in codecs.items():
@@ -200,12 +203,12 @@ def get_available_encoders() -> dict:
     return available
 
 
-def detect_gpus() -> list:
+def detect_gpus() -> list[tuple[str, str]]:
     """
     检测系统中可用的 GPU，返回 GPU 类型列表。
     优先返回独立显卡（NVIDIA > AMD > Intel）。
     """
-    gpus = []
+    gpus: list[tuple[str, str]] = []
 
     # 检测 NVIDIA GPU
     try:
@@ -252,8 +255,8 @@ def detect_gpus() -> list:
     gpus.append(("cpu", "CPU 软件编码"))
 
     # 去重并按优先级排序：nvidia > amd > intel > cpu
-    seen = set()
-    unique_gpus = []
+    seen: set[str] = set()
+    unique_gpus: list[tuple[str, str]] = []
     priority = {"nvidia": 0, "amd": 1, "intel": 2, "cpu": 3}
     gpus.sort(key=lambda x: priority.get(x[0], 99))
 
@@ -265,14 +268,18 @@ def detect_gpus() -> list:
     return unique_gpus
 
 
-def detect_encoder(codec: str, gpu: str, available_encoders: dict) -> Optional[str]:
+def detect_encoder(
+    codec: str, gpu: str, available_encoders: dict[str, dict[str, str]]
+) -> Optional[str]:
     """检测指定编解码器和 GPU 组合的可用编码器。"""
     if gpu in available_encoders and codec in available_encoders[gpu]:
         return available_encoders[gpu][codec]
     return None
 
 
-def detect_media_pairs(directory: Path = None) -> list:
+def detect_media_pairs(
+    directory: Optional[Path] = None,
+) -> list[tuple[Path, Path, Path]]:
     """
     扫描目录中的 MP4 文件，检测符合命名模式的视频/音频配对。
     命名模式: <prefix>-<stream_id>.mp4，如 36502112568-1-30116.mp4
@@ -287,7 +294,7 @@ def detect_media_pairs(directory: Path = None) -> list:
 
     # 按前缀分组：pattern 匹配 "xxx-数字.mp4" 格式
     pattern = re.compile(r"^(.+)-(\d+)\.mp4$", re.IGNORECASE)
-    groups = defaultdict(list)
+    groups: defaultdict[str, list[tuple[str, Path]]] = defaultdict(list)
 
     for f in mp4_files:
         match = pattern.match(f.name)
@@ -295,13 +302,13 @@ def detect_media_pairs(directory: Path = None) -> list:
             prefix, stream_id = match.groups()
             groups[prefix].append((stream_id, f))
 
-    pairs = []
+    pairs: list[tuple[Path, Path, Path]] = []
     for prefix, files in groups.items():
         if len(files) < 2:
             continue
 
-        video_file = None
-        audio_file = None
+        video_file: Optional[Path] = None
+        audio_file: Optional[Path] = None
 
         for stream_id, filepath in files:
             if stream_id in VIDEO_STREAM_IDS:
@@ -327,7 +334,9 @@ def detect_media_pairs(directory: Path = None) -> list:
     return pairs
 
 
-def prompt_encoding_choice(available_encoders: dict, gpus: list) -> tuple:
+def prompt_encoding_choice(
+    available_encoders: dict[str, dict[str, str]], gpus: list[tuple[str, str]]
+) -> tuple[str, bool, int, str, str]:
     """
     交互式提示用户选择编码方式和 GPU。
     返回: (codec: str, lossless: bool, crf: int, gpu: str, encoder: str)
@@ -365,12 +374,16 @@ def prompt_encoding_choice(available_encoders: dict, gpus: list) -> tuple:
         return "av1", False, crf, gpu, encoder
 
 
-def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple:
+def prompt_gpu_choice(
+    codec: str,
+    available_encoders: dict[str, dict[str, str]],
+    gpus: list[tuple[str, str]],
+) -> tuple[str, str]:
     """
     提示用户选择 GPU 进行编码。
     返回: (gpu_type: str, encoder: str)
     """
-    valid_gpus = []
+    valid_gpus: list[tuple[str, str, str]] = []
     for gpu_type, gpu_name in gpus:
         encoder = detect_encoder(codec, gpu_type, available_encoders)
         if encoder:
@@ -387,7 +400,7 @@ def prompt_gpu_choice(codec: str, available_encoders: dict, gpus: list) -> tuple
         print(f"\n使用编码器: {encoder} ({gpu_name})")
         return gpu_type, encoder
 
-    choices = []
+    choices: list[tuple[str, int]] = []
     for i, (gpu_type, gpu_name, encoder) in enumerate(valid_gpus):
         recommend = " (推荐)" if i == 0 and gpu_type != "cpu" else ""
         name = f"{GPU_NAMES.get(gpu_type, gpu_type)}: {gpu_name}{recommend} [{encoder}]"
@@ -416,7 +429,7 @@ def prompt_crf_choice(codec: str) -> int:
 
 def build_video_codec_args(
     codec: str, lossless: bool, crf: int, encoder: str, gpu: str
-) -> list:
+) -> list[str]:
     """根据编码模式返回视频编码参数列表。"""
     if codec == "copy":
         return ["-c:v", "copy"]
@@ -535,7 +548,7 @@ def merge(
     # 如果未指定编码器，自动检测
     if codec != "copy" and not encoder:
         available = get_available_encoders()
-        encoder = detect_encoder(codec, gpu, available)
+        encoder = detect_encoder(codec, gpu, available) or ""
         if not encoder:
             sys.exit(f"错误: 未找到支持 {codec.upper()} 的编码器")
 
@@ -577,7 +590,7 @@ def merge(
         out_size = Path(output_path).stat().st_size
         ratio = (1 - out_size / src_size) * 100 if src_size else 0
 
-        def _fmt_size(n: int) -> str:
+        def _fmt_size(n: float) -> str:
             for unit in ("B", "KB", "MB", "GB"):
                 if abs(n) < 1024:
                     return f"{n:.2f} {unit}"
@@ -680,7 +693,7 @@ def main() -> None:
                     encoder = enc
                     break
         else:
-            encoder = detect_encoder(codec, gpu, available)
+            encoder = detect_encoder(codec, gpu, available) or ""
 
         if not encoder:
             sys.exit(
@@ -688,7 +701,7 @@ def main() -> None:
                 f"尝试的 GPU: {gpu or '自动检测'}"
             )
 
-        print(f"使用编码器: {encoder} ({GPU_NAMES.get(gpu, gpu)})")
+        print(f"使用编码器: {encoder} ({GPU_NAMES.get(gpu or 'cpu', gpu or 'cpu')})")
 
     merge(
         args.video,
