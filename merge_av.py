@@ -308,7 +308,7 @@ def detect_media_pairs(
     返回: [(video_path, audio_path, suggested_output), ...]
     """
     if directory is None:
-        directory = Path(__file__).parent
+        directory = Path.cwd()
 
     mp4_files = list(directory.glob("*.mp4"))
     if not mp4_files:
@@ -811,7 +811,7 @@ def auto_optimize_and_merge(
 
 def auto_merge_mode() -> None:
     """自动检测模式：扫描当前目录并合并检测到的音视频配对。"""
-    script_dir = Path(__file__).parent
+    script_dir = Path.cwd()
     print(f"扫描目录: {script_dir}")
 
     pairs = detect_media_pairs(script_dir)

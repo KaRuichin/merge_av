@@ -15,6 +15,31 @@ pip install InquirerPy
 
 > 未安装 InquirerPy 时自动降级为键盘输入序号模式，功能不受影响。
 
+## Windows 构建（生成独立 .exe）
+
+项目支持使用 PyInstaller 打包为单文件可执行程序，无需安装 Python 即可运行。
+
+### 前置条件
+
+- 已安装 Python 3.7+ 并配置好虚拟环境
+- 已安装 [ffmpeg](https://ffmpeg.org/download.html) 并加入系统 PATH
+
+### 构建步骤
+
+```bat
+REM 方式一：直接双击运行
+build.bat
+
+REM 方式二：命令行执行
+.venv\Scripts\activate
+pip install pyinstaller
+pyinstaller merge_av.spec --clean --noconfirm
+```
+
+构建完成后，可执行文件位于 `dist\merge_av.exe`。
+
+> **注意：** 打包后的 .exe 仍需系统中已安装 ffmpeg 才能正常工作。
+
 ## 支持的编码器
 
 | 类型 | H.265/HEVC | AV1 |

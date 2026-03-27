@@ -4,3 +4,8 @@
 # Python cache files
 __pycache__/
 *.pyc
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
