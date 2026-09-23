@@ -1,6 +1,6 @@
 """
 merge_av.py
-将一个纯视频 MP4 和一个纯音频 MP4 合并为单个含音视频的 MP4 文件。
+将一个纯视频文件和一个纯音频文件（支持 .mp4 / .m4s / .m4a）合并为单个含音视频的 MP4 文件。
 支持直接流复制（默认）、H.265 或 AV1 重编码，支持 GPU 硬件加速。
 
 用法:
@@ -8,22 +8,22 @@ merge_av.py
     python merge_av.py
 
     # 直接复制（最快，无质量损失）
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4>
+    python merge_av.py <video> <audio> <output.mp4>
 
     # H.265 编码
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --h265
+    python merge_av.py <video> <audio> <output.mp4> --h265
 
     # AV1 视觉无损编码（体积更小）
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --av1
+    python merge_av.py <video> <audio> <output.mp4> --av1
 
     # 使用 NVIDIA GPU 加速
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --h265 --gpu nvidia
+    python merge_av.py <video> <audio> <output.mp4> --h265 --gpu nvidia
 
     # AV1 自定义质量（CRF 0=无损 ~ 63=最差，默认 23）
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --av1 --crf 28
+    python merge_av.py <video> <audio> <output.mp4> --av1 --crf 28
 
     # 智能优化模式（自动试压，选“满足质量阈值下最小体积”的方案）
-    python merge_av.py <video.mp4> <audio.mp4> <output.mp4> --auto-optimize
+    python merge_av.py <video> <audio> <output.mp4> --auto-optimize
 """
 
 import argparse
@@ -91,6 +91,21 @@ VIDEO_STREAM_IDS = {
     "30016",
 }
 AUDIO_STREAM_IDS = {"30280", "30232", "30216", "30250", "30251"}
+
+# 参与自动扫描的媒体文件扩展名（视频可能为 .mp4，音频可能为 .m4s/.m4a）
+SUPPORTED_MEDIA_EXTENSIONS = {".mp4", ".m4s", ".m4a"}
+_EXT_ALT = "mp4|m4s|m4a"
+
+# 命名模式: <前缀>-<质量>-<流ID>.<扩展名>（如 1091578122_sr2-1-100035.mp4）
+MEDIA_NAME_PATTERN = re.compile(
+    rf"^(?P<stem>.+?)-(?P<mid>\d+)-(?P<sid>\d+)\.(?P<ext>{_EXT_ALT})$",
+    re.IGNORECASE,
+)
+# 兼容旧命名模式: <前缀>-<流ID>.<扩展名>（如 36502112568-1.mp4）
+MEDIA_NAME_PATTERN_SIMPLE = re.compile(
+    rf"^(?P<stem>.+?)-(?P<sid>\d+)\.(?P<ext>{_EXT_ALT})$",
+    re.IGNORECASE,
+)
 
 
 QualityMetric = Literal["ssim", "vmaf"]
@@ -299,58 +314,149 @@ def detect_encoder(
     return None
 
 
+def _group_key(stem: str) -> str:
+    """
+    从文件名主干中提取分组标识。
+    优先使用开头的数字资源 ID（如 1091578122_sr2 -> 1091578122），
+    使同一资源的不同标签（sr2 / nb3 等）能归入同组。
+    """
+    match = re.match(r"^(\d+)", stem)
+    return match.group(1) if match else stem
+
+
+def probe_stream_types(path: Path) -> set[str]:
+    """
+    通过 ffprobe 检测文件实际包含的流类型集合。
+    返回形如 {"video"} / {"audio"} / {"video", "audio"} 的集合；
+    探测失败时返回空集合。
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode != 0:
+        return set()
+    return {
+        line.strip().lower() for line in result.stdout.splitlines() if line.strip()
+    }
+
+
+def _select_media_pair(
+    files: list[tuple[str, Path]],
+) -> tuple[Optional[Path], Optional[Path]]:
+    """
+    从同一资源分组的文件中选出 (视频文件, 音频文件)。
+    优先级: ffprobe 实际流类型 > 已知流 ID > 文件大小启发式。
+    """
+    probes: dict[Path, set[str]] = {fp: probe_stream_types(fp) for _, fp in files}
+
+    def _is_combined(entry: tuple[str, Path]) -> bool:
+        """文件同时含视频和音频流（通常已是合并结果）。"""
+        return {"video", "audio"} <= probes.get(entry[1], set())
+
+    candidates = files
+    # 分组中混入已合并文件时，优先排除它们
+    if len(files) > 2:
+        separated = [entry for entry in files if not _is_combined(entry)]
+        if len(separated) >= 2:
+            candidates = separated
+
+    # 1) 依据 ffprobe 探测到的流类型
+    video_only = [fp for _, fp in candidates if probes.get(fp) == {"video"}]
+    audio_only = [fp for _, fp in candidates if probes.get(fp) == {"audio"}]
+    if len(video_only) == 1 and len(audio_only) == 1:
+        return video_only[0], audio_only[0]
+
+    video_any = [fp for _, fp in candidates if "video" in probes.get(fp, set())]
+    audio_any = [
+        fp
+        for _, fp in candidates
+        if "audio" in probes.get(fp, set()) and fp not in video_any
+    ]
+    if video_any and audio_any:
+        return video_any[0], audio_any[0]
+
+    # 2) 回退: 依据已知平台流 ID 分类
+    video_file: Optional[Path] = None
+    audio_file: Optional[Path] = None
+    for stream_id, filepath in candidates:
+        if stream_id in VIDEO_STREAM_IDS and video_file is None:
+            video_file = filepath
+        elif stream_id in AUDIO_STREAM_IDS and audio_file is None:
+            audio_file = filepath
+    if video_file and audio_file and video_file != audio_file:
+        return video_file, audio_file
+
+    # 3) 回退: 文件体积判断（视频通常远大于音频）
+    if len(candidates) >= 2:
+        ordered = sorted(
+            candidates, key=lambda x: x[1].stat().st_size, reverse=True
+        )
+        return ordered[0][1], ordered[1][1]
+
+    return None, None
+
+
 def detect_media_pairs(
     directory: Optional[Path] = None,
 ) -> list[tuple[Path, Path, Path]]:
     """
-    扫描目录中的 MP4 文件，检测符合命名模式的视频/音频配对。
-    命名模式: <prefix>-<stream_id>.mp4，如 36502112568-1-30116.mp4
+    扫描目录中的媒体文件（.mp4 / .m4s / .m4a），检测视频/音频配对。
+
+    支持两种命名模式：
+      <前缀>-<质量>-<流ID>.<扩展名>  如 1091578122_sr2-1-100035.mp4（视频）
+                                       1091578122_nb3-1-30280.m4s（音频）
+      <前缀>-<流ID>.<扩展名>         如 36502112568-1-30116.mp4（视频）
+                                       36502112568-1-30280.mp4（音频）
+
+    同一资源（文件名开头的数字 ID 相同）的文件归为一组，
+    因此视频与音频即使扩展名、标签段不同也能正确配对。
     返回: [(video_path, audio_path, suggested_output), ...]
     """
     if directory is None:
         directory = Path.cwd()
 
-    mp4_files = list(directory.glob("*.mp4"))
-    if not mp4_files:
+    media_files = [
+        f
+        for f in directory.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
+    ]
+    if not media_files:
         return []
 
-    # 按前缀分组：pattern 匹配 "xxx-数字.mp4" 格式
-    pattern = re.compile(r"^(.+)-(\d+)\.mp4$", re.IGNORECASE)
     groups: defaultdict[str, list[tuple[str, Path]]] = defaultdict(list)
+    order: list[str] = []
 
-    for f in mp4_files:
-        match = pattern.match(f.name)
-        if match:
-            prefix, stream_id = match.groups()
-            groups[prefix].append((stream_id, f))
+    for f in sorted(media_files, key=lambda p: p.name):
+        match = MEDIA_NAME_PATTERN.match(f.name) or MEDIA_NAME_PATTERN_SIMPLE.match(
+            f.name
+        )
+        if not match:
+            continue
+        key = _group_key(match.group("stem"))
+        if key not in groups:
+            order.append(key)
+        groups[key].append((match.group("sid"), f))
 
     pairs: list[tuple[Path, Path, Path]] = []
-    for prefix, files in groups.items():
+    for key in order:
+        files = groups[key]
         if len(files) < 2:
             continue
 
-        video_file: Optional[Path] = None
-        audio_file: Optional[Path] = None
-
-        for stream_id, filepath in files:
-            if stream_id in VIDEO_STREAM_IDS:
-                video_file = filepath
-            elif stream_id in AUDIO_STREAM_IDS:
-                audio_file = filepath
-
-        # 启发式方法：文件大小判断
-        if video_file is None or audio_file is None:
-            sorted_files = sorted(files, key=lambda x: int(x[0]))
-            if len(sorted_files) >= 2:
-                file1, file2 = sorted_files[0][1], sorted_files[1][1]
-                if file1.stat().st_size > file2.stat().st_size:
-                    video_file, audio_file = file1, file2
-                else:
-                    video_file, audio_file = file2, file1
-
+        video_file, audio_file = _select_media_pair(files)
         if video_file and audio_file:
-            output_name = f"{prefix}.mp4"
-            output_path = directory / output_name
+            output_path = directory / f"{key}.mp4"
             pairs.append((video_file, audio_file, output_path))
 
     return pairs
@@ -818,8 +924,10 @@ def auto_merge_mode() -> None:
 
     if not pairs:
         print("未检测到可合并的音视频文件配对。")
-        print("文件命名需符合格式: <前缀>-<流ID>.mp4")
-        print("例如: 36502112568-1-30116.mp4 和 36502112568-1-30280.mp4")
+        print("支持的扩展名: .mp4 / .m4s / .m4a")
+        print("文件命名需符合格式: <前缀>-<质量>-<流ID>.<扩展名>")
+        print("例如: 1091578122_sr2-1-100035.mp4 和 1091578122_nb3-1-30280.m4s")
+        print("也兼容: 36502112568-1-30116.mp4 和 36502112568-1-30280.mp4")
         sys.exit(0)
 
     print(f"\n检测到 {len(pairs)} 组可合并的文件:")
@@ -966,11 +1074,11 @@ def main() -> None:
         return
 
     parser = argparse.ArgumentParser(
-        description="将分离的视频 MP4 与音频 MP4 合并为单个 MP4 文件（需要已安装 ffmpeg）",
+        description="将分离的视频与音频文件（.mp4 / .m4s / .m4a）合并为单个 MP4 文件（需要已安装 ffmpeg）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("video", nargs="?", help="纯视频 MP4 文件路径")
-    parser.add_argument("audio", nargs="?", help="纯音频 MP4 文件路径")
+    parser.add_argument("video", nargs="?", help="纯视频文件路径（.mp4 / .m4s）")
+    parser.add_argument("audio", nargs="?", help="纯音频文件路径（.mp4 / .m4s / .m4a）")
     parser.add_argument("output", nargs="?", help="输出 MP4 文件路径")
     parser.add_argument(
         "--h265",

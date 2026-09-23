@@ -1,6 +1,6 @@
 # merge_av
 
-将两个分离的 MP4 文件（一个仅含视频、一个仅含音频）合并为单个含音视频的 MP4。
+将两个分离的媒体文件（一个仅含视频、一个仅含音频，支持 `.mp4` / `.m4s` / `.m4a`）合并为单个含音视频的 MP4。
 支持直接流复制（默认）、H.265 或 AV1 重编码，**支持 GPU 硬件加速**，并提供 **智能优化（自动试压）** 模式。
 
 ## 依赖
@@ -21,29 +21,48 @@ pip install InquirerPy
 
 ### 前置条件
 
-- 已安装 Python 3.7+ 并配置好虚拟环境
+- 已安装 Python 3.7+（有可用虚拟环境更佳）
 - 已安装 [ffmpeg](https://ffmpeg.org/download.html) 并加入系统 PATH
 
-### 构建步骤
+### 一键构建（推荐）
 
 ```bat
-REM 方式一：直接双击运行
+REM 方式一：双击 build.bat，或在命令行 / PowerShell 中执行
 build.bat
 
-REM 方式二：命令行执行
+REM 方式二：不暂停（供脚本 / CI / VS Code 任务调用）
+build.bat nopause
+```
+
+脚本会自动完成：
+
+1. 选择 Python 解释器（优先 `.venv`；若虚拟环境已失效则回退到全局 Python）
+2. 校验 `merge_av.py` 与 `merge_av.spec` 是否存在
+3. 检测并按需安装 PyInstaller
+4. 检测并按需安装可选依赖 InquirerPy（失败时降级为键盘序号输入模式）
+5. 执行 `pyinstaller merge_av.spec --clean --noconfirm`
+6. 校验产物并输出结果路径
+
+在 VS Code 中也可以直接按 `Ctrl+Shift+B` 运行「build: 打包 exe (PyInstaller)」任务。
+
+### 手动构建
+
+```bat
 .venv\Scripts\activate
-pip install pyinstaller
+pip install pyinstaller inquirerpy
 pyinstaller merge_av.spec --clean --noconfirm
 ```
 
 构建完成后，可执行文件位于 `dist\merge_av.exe`。
 
 > **注意：** 打包后的 .exe 仍需系统中已安装 ffmpeg 才能正常工作。
+>
+> 若 `.venv` 报错（例如基础 Python 被移动或删除），可用 `python -m venv --clear .venv` 重建。
 
 ## 支持的编码器
 
 | 类型 | H.265/HEVC | AV1 |
-|------|------------|-----|
+| ------ | ------------ | ----- |
 | **NVIDIA** (NVENC) | `hevc_nvenc` | `av1_nvenc` |
 | **AMD** (AMF) | `hevc_amf` | `av1_amf` |
 | **Intel** (QSV) | `hevc_qsv` | `av1_qsv` |
@@ -72,10 +91,21 @@ python merge_av.py
 - **↑↓ 方向键** 移动光标后 Enter 确认
 - **数字键 1-9** 快速跳转到对应选项
 
-支持的文件命名格式：`<前缀>-<流ID>.mp4`，例如：
+支持的文件命名格式（同一资源按文件名开头的数字 ID 自动配对）：
 
-- `36502112568-1-30116.mp4`（视频）
-- `36502112568-1-30280.mp4`（音频）
+```text
+<前缀>-<质量>-<流ID>.<扩展名>    # 如 1091578122_sr2-1-100035.mp4
+<前缀>-<流ID>.<扩展名>          # 如 36502112568-1-30116.mp4
+```
+
+例如：
+
+- `1091578122_sr2-1-100035.mp4`（视频）+ `1091578122_nb3-1-30280.m4s`（音频）→ `1091578122.mp4`
+- `36502112568-1-30116.mp4`（视频）+ `36502112568-1-30280.mp4`（音频）→ `36502112568.mp4`
+
+> 视频与音频的文件名前缀、扩展名可以不同（如视频为 `.mp4`、音频为 `.m4s`）；
+> 程序会先用流 ID 判断，再用 `ffprobe` 实际探测流类型，仍无法确定时按文件体积推断，
+> 因此即使流 ID 未知也能正确区分视频与音频。
 
 ### 手动模式
 
@@ -84,7 +114,7 @@ python merge_av.py <video.mp4> <audio.mp4> <output.mp4> [选项]
 ```
 
 | 选项 | 说明 |
-|------|------|
+| ------ | ------ |
 | _(无)_ | 直接复制流，最快，零质量损失 |
 | `--auto-optimize` | 智能优化：自动试压并选择满足质量阈值下体积最小的方案 |
 | `--h265` | H.265/HEVC 编码（兼容性好） |
@@ -177,7 +207,7 @@ python merge_av.py video_only.mp4 audio_only.mp4 output.mp4 --av1 --crf 18
 ## 编码格式对比
 
 | 格式 | 压缩率 | 兼容性 | 编码速度 |
-|------|--------|--------|----------|
+| ------ | -------- | -------- | ---------- |
 | **直接复制** | - | 最好 | 最快 |
 | **H.265/HEVC** | 好 | 好 | 中等 |
 | **AV1** | 最好 | 一般 | 较慢 |

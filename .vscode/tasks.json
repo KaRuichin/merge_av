@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build: 打包 exe (PyInstaller)",
+            "type": "shell",
+            "command": "${workspaceFolder}\\build.bat",
+            "args": [
+                "nopause"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "build: 清理构建缓存",
+            "type": "shell",
+            "command": "Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue; Write-Host '已清理 build/ 与 dist/'",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        }
+    ]
+}
